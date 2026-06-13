@@ -507,6 +507,21 @@ def test_base_gateway_replies_to_triggering_message_for_telegram_dm_topic():
     assert _reply_anchor_for_event(event) == "463"
 
 
+def test_base_gateway_uses_prompt_anchor_for_telegram_callback_event():
+    """Action-button callbacks have synthetic ids that cannot be Telegram replies."""
+    event = SimpleNamespace(
+        message_id="callback:750:ab_123:approve",
+        reply_to_message_id="750",
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            thread_id="20189",
+        ),
+    )
+
+    assert _reply_anchor_for_event(event) == "750"
+
+
 @pytest.mark.asyncio
 async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegram_dm_topic(monkeypatch, tmp_path):
     """GatewayRunner's duplicate thread metadata must match the base helper."""
