@@ -89,15 +89,31 @@ def _reply_anchor_for_event(event) -> str | None:
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
     thread_id = getattr(source, "thread_id", None)
-    if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
-        # Reply to the triggering user message. Replying to Telegram's earlier
-        # topic seed/anchor can render the bot response outside the active lane.
-        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-    if platform == "telegram" and thread_id:
-        return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
-    return getattr(event, "message_id", None)
+    message_id = getattr(event, "message_id", None)
+    reply_to_message_id = getattr(event, "reply_to_message_id", None)
+    if platform == "telegram":
+        # Telegram reply anchors must be numeric Bot API message ids. Synthetic
+        # events such as action-button callbacks use ids like "callback:...";
+        # replying to those breaks final delivery and leaves button spinners
+        # looking stuck. Prefer the real prompt/user message id when present.
+        try:
+            if message_id is not None:
+                int(str(message_id))
+                telegram_anchor = message_id
+            else:
+                telegram_anchor = None
+        except (TypeError, ValueError):
+            telegram_anchor = reply_to_message_id
+        if thread_id and getattr(source, "chat_type", None) == "dm":
+            # Reply to the triggering user message. Replying to Telegram's earlier
+            # topic seed/anchor can render the bot response outside the active lane.
+            return telegram_anchor or reply_to_message_id
+        if thread_id:
+            return None
+        return telegram_anchor
+    if platform == "feishu" and thread_id and reply_to_message_id:
+        return reply_to_message_id
+    return message_id
 
 
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
@@ -1462,6 +1478,13 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+
+    # Internal flag — when this event arrives while the target session is
+    # already running, preserve it as a queued follow-up instead of applying
+    # the normal busy-input policy (interrupt/steer/queue).  Telegram action
+    # buttons use this so rapid approval taps never abort the approval currently
+    # being actioned and never overwrite each other in the pending slot.
+    queue_when_busy: bool = False
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)

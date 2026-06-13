@@ -3702,6 +3702,127 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Generic send_message action buttons (sm:request_id:choice_id) ---
+        if data.startswith("sm:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid action button data.")
+                return
+            request_id, choice_id = parts[1], parts[2]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use this button.")
+                return
+
+            try:
+                from tools.action_button_registry import consume_action_button_choice
+                result = consume_action_button_choice(
+                    request_id,
+                    choice_id,
+                    resolved_by=getattr(query.from_user, "first_name", None) or caller_id,
+                )
+            except Exception as exc:
+                logger.error("[%s] action-button callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Action button handler failed.")
+                return
+
+            status = str(result.get("status", ""))
+            if status == "already_resolved":
+                await query.answer(text="This button has already been resolved.")
+                return
+            if status == "expired":
+                await query.answer(text="This button has expired.")
+                return
+            if status != "resolved":
+                await query.answer(text="This button is no longer available.")
+                return
+
+            response_text = str(result.get("response_text") or "").strip()
+            label = str(result.get("label") or choice_id)
+            if not response_text:
+                await query.answer(text="Button response is empty.")
+                return
+
+            user_display = getattr(query.from_user, "first_name", "User")
+            await query.answer(text=f"✓ {label[:60]}")
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"✅ {label} by {user_display}"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
+            if not self._message_handler or query_chat_id is None:
+                logger.warning("[%s] action-button callback has no message handler", self.name)
+                return
+
+            prompt_message_id = getattr(query.message, "message_id", None) if query.message else None
+            prompt_text = (
+                getattr(query.message, "text", None)
+                or getattr(query.message, "caption", None)
+                or None
+            ) if query.message else None
+            chat = getattr(query.message, "chat", None) if query.message else None
+            chat_type_raw = getattr(chat, "type", query_chat_type)
+            chat_type_value = getattr(chat_type_raw, "value", chat_type_raw)
+            chat_type_text = str(chat_type_value).lower() if chat_type_value is not None else "private"
+            normalized_chat_type = "dm" if "private" in chat_type_text else ("channel" if "channel" in chat_type_text else "group")
+            source = self.build_source(
+                chat_id=str(query_chat_id),
+                chat_name=getattr(chat, "title", None) or getattr(chat, "full_name", None) or None,
+                chat_type=normalized_chat_type,
+                user_id=caller_id or None,
+                user_name=getattr(query.from_user, "full_name", None) or user_display,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                message_id=f"callback:{prompt_message_id}:{request_id}:{choice_id}",
+            )
+            event = MessageEvent(
+                text=response_text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=query,
+                message_id=f"callback:{prompt_message_id}:{request_id}:{choice_id}",
+                reply_to_message_id=str(prompt_message_id) if prompt_message_id is not None else None,
+                reply_to_text=prompt_text,
+                queue_when_busy=True,
+            )
+            try:
+                response = await self._message_handler(event)
+                text, _ttl = self._unwrap_ephemeral(response)
+                if text:
+                    send_kwargs: Dict[str, Any] = {
+                        "chat_id": int(query_chat_id),
+                        "text": self.format_message(text),
+                        "parse_mode": ParseMode.MARKDOWN_V2,
+                        **self._link_preview_kwargs(),
+                    }
+                    if query_thread_id is not None:
+                        send_kwargs.update(
+                            self._thread_kwargs_for_send(
+                                str(query_chat_id),
+                                str(query_thread_id),
+                                {"thread_id": str(query_thread_id)},
+                                reply_to_mode=self._reply_to_mode,
+                            )
+                        )
+                    await self._send_message_with_thread_fallback(**send_kwargs)
+            except Exception as exc:
+                logger.error("[%s] action-button synthetic message failed: %s", self.name, exc, exc_info=True)
+                await self._send_message_with_thread_fallback(
+                    chat_id=int(query_chat_id),
+                    text="Action button was received, but Hermes failed to process it.",
+                    **self._link_preview_kwargs(),
+                )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)

@@ -156,6 +156,23 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "action_buttons": {
+                "type": "array",
+                "description": "Optional Telegram action buttons. Each row is an array of {text, response_text, id?, consume?}. When clicked, the gateway injects response_text back into the normal chat flow. Prefer this over raw callback_data for user approvals.",
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "response_text": {"type": "string"},
+                            "id": {"type": "string"},
+                            "consume": {"type": "boolean"}
+                        },
+                        "required": ["text", "response_text"]
+                    }
+                }
             }
         },
         "required": []
@@ -284,11 +301,14 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    action_buttons = args.get("action_buttons")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
+    if action_buttons and platform_name != "telegram":
+        return tool_error("action_buttons are currently supported only for Telegram targets")
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     thread_id = None
@@ -426,6 +446,7 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                action_buttons=action_buttons,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -455,6 +476,64 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _build_action_button_markup(*, platform_name: str, chat_id: str, thread_id: str | None, message: str, action_buttons):
+    """Register Telegram action buttons and return InlineKeyboardMarkup."""
+    if platform_name != "telegram":
+        raise ValueError("action_buttons are currently supported only for Telegram targets")
+    if not isinstance(action_buttons, list) or not action_buttons:
+        raise ValueError("action_buttons must be a non-empty list of rows")
+
+    choices = {}
+    refs = []
+    for row_idx, row in enumerate(action_buttons):
+        if not isinstance(row, list) or not row:
+            raise ValueError("each action_buttons row must be a non-empty list")
+        ref_row = []
+        for col_idx, button in enumerate(row):
+            if not isinstance(button, dict):
+                raise ValueError("each action button must be an object")
+            label = str(button.get("text", "")).strip()
+            response_text = str(button.get("response_text", "")).strip()
+            if not label or not response_text:
+                raise ValueError("each action button requires text and response_text")
+            raw_id = str(button.get("id") or label or f"b{row_idx}_{col_idx}")
+            key = f"{row_idx}_{col_idx}_{raw_id}"
+            choices[key] = {
+                "id": button.get("id") or raw_id,
+                "label": label,
+                "response_text": response_text,
+                "consume": button.get("consume", True),
+            }
+            ref_row.append((key, label))
+        refs.append(ref_row)
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from tools.action_button_registry import create_action_button_entry
+
+    entry = create_action_button_entry(
+        platform="telegram",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        text_preview=message,
+        choices=choices,
+    )
+    stored = entry["choices"]
+    rows = []
+    for ref_row in refs:
+        out_row = []
+        for key, label in ref_row:
+            choice = stored.get(key)
+            if choice is None:
+                wanted = choices[key]
+                choice = next(
+                    c for c in stored.values()
+                    if c.get("label") == wanted["label"] and c.get("response_text") == wanted["response_text"]
+                )
+            out_row.append(InlineKeyboardButton(label, callback_data=choice["callback_data"]))
+        rows.append(out_row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
@@ -686,7 +765,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, action_buttons=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -763,6 +842,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            reply_markup = None
+            if is_last and action_buttons:
+                reply_markup = _build_action_button_markup(
+                    platform_name="telegram",
+                    chat_id=str(chat_id),
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                    message=message,
+                    action_buttons=action_buttons,
+                )
             result = await _send_telegram(
                 pconfig.token,
                 chat_id,
@@ -771,6 +859,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 disable_link_previews=disable_link_previews,
                 force_document=force_document,
+                reply_markup=reply_markup,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -943,7 +1032,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, reply_markup=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1033,6 +1122,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         warnings = []
 
         if formatted.strip():
+            if reply_markup is not None:
+                text_kwargs["reply_markup"] = reply_markup
             try:
                 last_msg = await _send_telegram_message_with_retry(
                     bot,

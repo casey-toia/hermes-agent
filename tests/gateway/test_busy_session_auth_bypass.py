@@ -165,6 +165,38 @@ class TestBusySessionAuthBypass:
         assert sk in adapter._pending_messages
 
     @pytest.mark.asyncio
+    async def test_action_button_approval_is_forced_to_fifo_queue_when_busy(self):
+        """Action-button approvals should queue behind active work, not interrupt it."""
+        from gateway.run import GatewayRunner
+
+        runner, sentinel = _make_runner(authorized_users={"user1"})
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "interrupt"
+        adapter = _make_adapter()
+
+        first = _make_event(text="approve first", user_id="user1")
+        first.queue_when_busy = True
+        sk = build_session_key(first.source)
+        running_agent = MagicMock()
+        running_agent.get_activity_summary.return_value = {}
+        runner._running_agents[sk] = running_agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[first.source.platform] = adapter
+
+        second = _make_event(text="approve second", user_id="user1")
+        second.source = first.source
+        second.queue_when_busy = True
+
+        result1 = await GatewayRunner._handle_active_session_busy_message(runner, first, sk)
+        result2 = await GatewayRunner._handle_active_session_busy_message(runner, second, sk)
+
+        assert result1 is True
+        assert result2 is True
+        running_agent.interrupt.assert_not_called()
+        assert adapter._pending_messages[sk].text == "approve first"
+        assert runner._queued_events[sk][0].text == "approve second"
+
+    @pytest.mark.asyncio
     async def test_unauthorized_user_during_drain_still_blocked(self):
         """Even during drain mode, unauthorized users must be dropped."""
         from gateway.run import GatewayRunner
