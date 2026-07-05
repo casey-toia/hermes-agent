@@ -167,6 +167,92 @@ def create_action_button_entry(
     return entry
 
 
+def _choice_result(status: str, request_id: str, choice_id: str, choice: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": status,
+        "request_id": request_id,
+        "choice_id": choice_id,
+        "label": choice.get("label") or choice_id,
+        "response_text": choice.get("response_text") or "",
+        "entry": entry,
+    }
+
+
+def claim_action_button_choice(request_id: str, choice_id: str, *, resolved_by: str | None = None) -> dict[str, Any]:
+    now = _now()
+    with _locked_registry() as data:
+        entry = data.setdefault("entries", {}).get(request_id)
+        if not isinstance(entry, dict):
+            return {"status": "not_found"}
+        current_status = entry.get("status", "pending")
+        if current_status != "pending":
+            return {
+                "status": "already_resolved",
+                "request_id": request_id,
+                "resolved_choice": entry.get("resolved_choice"),
+            }
+        expires_at = _parse_iso(entry.get("expires_at"))
+        if expires_at is not None and expires_at <= now:
+            entry["status"] = "expired"
+            return {"status": "expired", "request_id": request_id}
+        raw_choices = entry.get("choices")
+        choices = raw_choices if isinstance(raw_choices, dict) else {}
+        choice = choices.get(choice_id)
+        if not isinstance(choice, dict):
+            return {"status": "not_found", "request_id": request_id}
+        if choice.get("consume", True):
+            entry["status"] = "claimed"
+            entry["resolved_by"] = resolved_by
+            entry["resolved_at"] = _iso(now)
+            entry["resolved_choice"] = choice_id
+        return _choice_result("claimed", request_id, choice_id, choice, entry)
+
+
+def mark_action_button_enqueued(
+    request_id: str,
+    choice_id: str,
+    *,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    with _locked_registry() as data:
+        entry = data.setdefault("entries", {}).get(request_id)
+        if not isinstance(entry, dict):
+            return {"status": "not_found"}
+        if entry.get("resolved_choice") != choice_id:
+            return {"status": "not_found", "request_id": request_id}
+        if entry.get("status") == "enqueued":
+            return {"status": "already_resolved", "request_id": request_id, "resolved_choice": choice_id}
+        if entry.get("status") != "claimed":
+            return {
+                "status": "already_resolved",
+                "request_id": request_id,
+                "resolved_choice": entry.get("resolved_choice"),
+            }
+        entry["status"] = "enqueued"
+        entry["enqueued_at"] = _iso(_now())
+        entry["enqueued_message_id"] = message_id
+        return {"status": "enqueued", "request_id": request_id, "resolved_choice": choice_id, "entry": entry}
+
+
+def release_action_button_claim(request_id: str, choice_id: str, *, reason: str) -> dict[str, Any]:
+    with _locked_registry() as data:
+        entry = data.setdefault("entries", {}).get(request_id)
+        if not isinstance(entry, dict):
+            return {"status": "not_found"}
+        if entry.get("status") != "claimed" or entry.get("resolved_choice") != choice_id:
+            return {
+                "status": str(entry.get("status", "not_found")),
+                "request_id": request_id,
+                "resolved_choice": entry.get("resolved_choice"),
+            }
+        entry["status"] = "pending"
+        entry["resolved_by"] = None
+        entry["resolved_at"] = None
+        entry["resolved_choice"] = None
+        entry["last_claim_error"] = _preview(reason, 500)
+        return {"status": "pending", "request_id": request_id}
+
+
 def consume_action_button_choice(request_id: str, choice_id: str, *, resolved_by: str | None = None) -> dict[str, Any]:
     now = _now()
     with _locked_registry() as data:
