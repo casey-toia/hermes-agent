@@ -3668,6 +3668,15 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _safe_answer_callback_query(self, query: Any, *, text: str | None = None) -> bool:
+        """Best-effort Telegram callback acknowledgement; delivery must not depend on it."""
+        try:
+            await query.answer(text=text)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Telegram callback answer failed: %s", self.name, exc)
+            return False
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3721,50 +3730,49 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             try:
-                from tools.action_button_registry import consume_action_button_choice
-                result = consume_action_button_choice(
+                from tools.action_button_registry import (
+                    claim_action_button_choice,
+                    mark_action_button_enqueued,
+                    release_action_button_claim,
+                )
+                result = claim_action_button_choice(
                     request_id,
                     choice_id,
                     resolved_by=getattr(query.from_user, "first_name", None) or caller_id,
                 )
             except Exception as exc:
                 logger.error("[%s] action-button callback failed: %s", self.name, exc, exc_info=True)
-                await query.answer(text="Action button handler failed.")
+                await self._safe_answer_callback_query(query, text="Action button handler failed.")
                 return
 
             status = str(result.get("status", ""))
             if status == "already_resolved":
-                await query.answer(text="This button has already been resolved.")
+                await self._safe_answer_callback_query(query, text="This button has already been accepted.")
                 return
             if status == "expired":
-                await query.answer(text="This button has expired.")
+                await self._safe_answer_callback_query(query, text="This button has expired.")
                 return
-            if status != "resolved":
-                await query.answer(text="This button is no longer available.")
+            if status != "claimed":
+                await self._safe_answer_callback_query(query, text="This button is no longer available.")
                 return
 
             response_text = str(result.get("response_text") or "").strip()
             label = str(result.get("label") or choice_id)
             if not response_text:
-                await query.answer(text="Button response is empty.")
+                release_action_button_claim(request_id, choice_id, reason="empty response text")
+                await self._safe_answer_callback_query(query, text="Button response is empty.")
+                return
+
+            handler = self._message_handler
+            if not handler or query_chat_id is None:
+                release_action_button_claim(request_id, choice_id, reason="missing message handler or chat id")
+                logger.warning("[%s] action-button callback has no message handler", self.name)
+                await self._safe_answer_callback_query(query, text="Action button handler unavailable.")
                 return
 
             user_display = getattr(query.from_user, "first_name", "User")
-            await query.answer(text=f"✓ {label[:60]}")
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(f"✅ {label} by {user_display}"),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-
-            if not self._message_handler or query_chat_id is None:
-                logger.warning("[%s] action-button callback has no message handler", self.name)
-                return
-
             prompt_message_id = getattr(query.message, "message_id", None) if query.message else None
+            synthetic_message_id = f"callback:{prompt_message_id}:{request_id}:{choice_id}"
             prompt_text = (
                 getattr(query.message, "text", None)
                 or getattr(query.message, "caption", None)
@@ -3782,45 +3790,67 @@ class TelegramAdapter(BasePlatformAdapter):
                 user_id=caller_id or None,
                 user_name=getattr(query.from_user, "full_name", None) or user_display,
                 thread_id=str(query_thread_id) if query_thread_id is not None else None,
-                message_id=f"callback:{prompt_message_id}:{request_id}:{choice_id}",
+                message_id=synthetic_message_id,
             )
             event = MessageEvent(
                 text=response_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 raw_message=query,
-                message_id=f"callback:{prompt_message_id}:{request_id}:{choice_id}",
+                message_id=synthetic_message_id,
                 reply_to_message_id=str(prompt_message_id) if prompt_message_id is not None else None,
                 reply_to_text=prompt_text,
                 queue_when_busy=True,
             )
-            try:
-                response = await self._message_handler(event)
-                text, _ttl = self._unwrap_ephemeral(response)
-                if text:
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": int(query_chat_id),
-                        "text": self.format_message(text),
-                        "parse_mode": ParseMode.MARKDOWN_V2,
-                        **self._link_preview_kwargs(),
-                    }
-                    if query_thread_id is not None:
-                        send_kwargs.update(
-                            self._thread_kwargs_for_send(
-                                str(query_chat_id),
-                                str(query_thread_id),
-                                {"thread_id": str(query_thread_id)},
-                                reply_to_mode=self._reply_to_mode,
+
+            async def _process_action_button_event() -> None:
+                try:
+                    response = await handler(event)
+                    text, _ttl = self._unwrap_ephemeral(response)
+                    if text:
+                        send_kwargs: Dict[str, Any] = {
+                            "chat_id": int(query_chat_id),
+                            "text": self.format_message(text),
+                            "parse_mode": ParseMode.MARKDOWN_V2,
+                            **self._link_preview_kwargs(),
+                        }
+                        if query_thread_id is not None:
+                            send_kwargs.update(
+                                self._thread_kwargs_for_send(
+                                    str(query_chat_id),
+                                    str(query_thread_id),
+                                    {"thread_id": str(query_thread_id)},
+                                    reply_to_mode=self._reply_to_mode,
+                                )
                             )
-                        )
-                    await self._send_message_with_thread_fallback(**send_kwargs)
+                        await self._send_message_with_thread_fallback(**send_kwargs)
+                except Exception as exc:
+                    logger.error("[%s] action-button synthetic message failed: %s", self.name, exc, exc_info=True)
+                    await self._send_message_with_thread_fallback(
+                        chat_id=int(query_chat_id),
+                        text="Action button was received, but Hermes failed to process it.",
+                        **self._link_preview_kwargs(),
+                    )
+
+            try:
+                asyncio.create_task(_process_action_button_event())
+                mark_action_button_enqueued(request_id, choice_id, message_id=synthetic_message_id)
             except Exception as exc:
-                logger.error("[%s] action-button synthetic message failed: %s", self.name, exc, exc_info=True)
-                await self._send_message_with_thread_fallback(
-                    chat_id=int(query_chat_id),
-                    text="Action button was received, but Hermes failed to process it.",
-                    **self._link_preview_kwargs(),
+                release_action_button_claim(request_id, choice_id, reason=str(exc))
+                logger.error("[%s] action-button enqueue failed: %s", self.name, exc, exc_info=True)
+                await self._safe_answer_callback_query(query, text="Action button handler failed.")
+                return
+
+            await self._safe_answer_callback_query(query, text=f"✓ {label[:60]}")
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"✅ {label} by {user_display} — queued"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
                 )
+            except Exception:
+                pass
+            await asyncio.sleep(0)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
