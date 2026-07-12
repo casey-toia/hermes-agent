@@ -316,11 +316,23 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        session_fp = None
+        try:
+            from gateway.session_context import get_session_env
+
+            session_fp = (
+                get_session_env("HERMES_SESSION_PLATFORM", ""),
+                get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                get_session_env("HERMES_SESSION_THREAD_ID", ""),
+            )
+        except Exception:
+            session_fp = None
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            session_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )

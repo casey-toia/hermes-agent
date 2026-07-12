@@ -151,6 +151,16 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if getattr(fn, "_hermes_skip_check_cache", False):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "check_fn %s raised; dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)

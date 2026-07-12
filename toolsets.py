@@ -59,8 +59,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
-    # Clarifying questions
-    "clarify",
+    # Clarifying questions + current-chat Telegram action buttons
+    "clarify", "send_action_buttons",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -233,6 +233,12 @@ TOOLSETS = {
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
+        "includes": []
+    },
+
+    "messaging": {
+        "description": "Current-chat messaging actions such as Telegram action-button prompts",
+        "tools": ["send_action_buttons"],
         "includes": []
     },
     
