@@ -35,6 +35,18 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
 
 
+def test_live_gpt6_astra_catalog_also_offers_gpt6sol(monkeypatch):
+    """A live account that advertises GPT-6 Astra can select the newer GPT-6 Sol slug."""
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda _access_token: ["gpt-6-astra"],
+    )
+
+    model_ids = get_codex_model_ids(access_token="codex-access-token")
+
+    assert "gpt-6-sol" in model_ids
+
+
 def test_picker_synthesizes_900k_variants_for_verified_slugs():
     """Every live-verified large-context slug gets an explicit ``-900k``
     picker variant directly after its base entry; slugs that genuinely
