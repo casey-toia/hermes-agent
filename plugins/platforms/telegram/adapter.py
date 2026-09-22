@@ -4227,6 +4227,22 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
+    async def send_frnd_action_buttons(self, chat_id: str, thread_id: str, message: str,
+                                       button_id: str, proposal_id: str) -> SendResult:
+        """One independent, non-expiring FRND card in the current chat/topic."""
+        def build():
+            text = f"<b>FRND proposal {_html.escape(proposal_id)}</b>\n\n{_html.escape(message)}"
+            if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+                return SendResult(success=False, error="Proposal card exceeds Telegram message limit")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"ab:{button_id}:a"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"ab:{button_id}:d"),
+            ]])
+            return text, keyboard, None
+        return await self._send_prompt(
+            "send_frnd_action_buttons", chat_id, None, build, parse_mode=ParseMode.HTML,
+            thread_id=thread_id or None)
+
     @staticmethod
     def _provider_get_label():
         try:
@@ -4631,12 +4647,58 @@ class TelegramAdapter(BasePlatformAdapter):
                     await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("ab:", self._handle_frnd_action_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_frnd_action_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """Admit an authenticated FRND choice as its own queued chat turn."""
+        parts = data.split(":")
+        if len(parts) != 3 or parts[2] not in {"a", "d"}:
+            await query.answer(text="Invalid proposal button.")
+            return
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+            return
+        message = getattr(query, "message", None)
+        if message is None or cb["chat_id"] is None or getattr(message, "message_id", None) is None:
+            await query.answer(text="Proposal card unavailable.")
+            return
+        chat_id = str(cb["chat_id"])
+        # Use the same routable topic normalization as ordinary Telegram input:
+        # forum General is lane 1 even when Bot API omits message_thread_id.
+        thread_id = self._effective_message_thread_id(message) or ""
+        telegram_type = self._chat_type_str(getattr(message, "chat", None))
+        chat_type = "group" if telegram_type in {"group", "supergroup"} else (
+            "channel" if telegram_type == "channel" else "dm")
+        source = self.build_source(
+            chat_id=chat_id, chat_type=chat_type,
+            user_id=str(query.from_user.id), user_name=cb["user_name"], thread_id=thread_id or None)
+        from gateway.platforms.event import MessageEvent, MessageType
+        event = MessageEvent(
+            text="", message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False)
+        session_key = self._event_session_key(event)
+        from tools import telegram_action_buttons as buttons
+        proposal_id = buttons.claim(parts[1], chat_id, thread_id, session_key, str(message.message_id))
+        if not proposal_id:
+            await query.answer(text="This proposal button was already used or is for another chat.")
+            return
+        event.text = f"{'approve' if parts[2] == 'a' else 'deny'} {proposal_id}"
+        try:
+            await self.handle_message(event)
+            if event._gateway_accepted is not True:
+                raise RuntimeError("Gateway did not accept the proposal choice")
+        except Exception:
+            buttons.release(parts[1])
+            await query.answer(text="Gateway could not queue this choice; please tap again.")
+            return
+        await query.answer(text="Choice queued")
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
