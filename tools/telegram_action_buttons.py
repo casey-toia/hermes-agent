@@ -1,4 +1,4 @@
-"""Current-chat FRND proposal buttons; durable, one-shot callbacks per proposal."""
+"""Current-chat proposal buttons; durable, one-shot callbacks per proposal."""
 
 import asyncio
 import json
@@ -12,7 +12,7 @@ from gateway.session_context import get_session_env
 from hermes_constants import get_process_hermes_home
 from tools.registry import registry, tool_error
 
-_PROPOSAL = re.compile(r"frnd-[A-Za-z0-9][A-Za-z0-9-]*\Z")
+_PROPOSAL = re.compile(r"(?:frnd-[A-Za-z0-9][A-Za-z0-9-]*|cal_[A-Za-z0-9_]+|storypark_attendance_[0-9]+)\Z")
 
 
 def _db():
@@ -66,7 +66,7 @@ def send_action_buttons_tool(args, **_kw):
     proposal_id = args.get("proposal_id")
     message = args.get("message")
     if not isinstance(proposal_id, str) or not _PROPOSAL.fullmatch(proposal_id):
-        return tool_error("proposal_id must be a literal frnd- identifier")
+        return tool_error("proposal_id must be a literal frnd-, cal_, or storypark_attendance_ identifier")
     if not isinstance(message, str) or not message.strip() or len(message) > 3000:
         return tool_error("message must contain 1–3000 characters")
     if get_session_env("HERMES_SESSION_PLATFORM") != "telegram" or get_session_env("HERMES_SESSION_PROFILE") not in ("", "default"):
@@ -76,6 +76,10 @@ def send_action_buttons_tool(args, **_kw):
     session_key = get_session_env("HERMES_SESSION_KEY")
     if not chat_id or not session_key:
         return tool_error("A current Telegram chat and session are required")
+    if proposal_id.startswith("storypark_attendance_"):
+        pending = get_process_hermes_home() / "state" / "client-comms-pending" / f"approve_{proposal_id}.json"
+        if not pending.is_file():
+            return tool_error("Storypark attendance proposal is not pending")
     from gateway.config import Platform
     from tools.send_message_senders import _live_adapter
     runner, adapter = _live_adapter(Platform.TELEGRAM)
@@ -102,9 +106,9 @@ def send_action_buttons_tool(args, **_kw):
 registry.register(
     name="send_action_buttons", toolset="telegram_action_buttons",
     schema={"name": "send_action_buttons",
-            "description": "Send durable Approve/Deny buttons for a FRND proposal in this Telegram chat. Each card is independent; clicks queue as separate user turns.",
+            "description": "Send durable Approve/Deny buttons for a FRND task, Agent Coordination calendar, or pending Storypark attendance proposal in this Telegram chat. Each card is independent; clicks queue as separate user turns.",
             "parameters": {"type": "object", "properties": {
-                "proposal_id": {"type": "string", "description": "Exact FRND ledger ID, e.g. frnd-123."},
+                "proposal_id": {"type": "string", "description": "Exact pending FRND, calendar, or Storypark ID, e.g. frnd-123, cal_intro_123, or storypark_attendance_98315."},
                 "message": {"type": "string", "description": "Proposal summary displayed with its exact ID."}},
                 "required": ["proposal_id", "message"]}},
     handler=send_action_buttons_tool,

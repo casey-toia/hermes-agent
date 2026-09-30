@@ -74,6 +74,86 @@ def test_tool_is_telegram_only_and_sends_bound_card(tmp_path, monkeypatch):
         thread.join()
         loop.close()
 
+def test_calendar_card_is_bound_and_queues_its_exact_choice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    discover_builtin_tools()
+    adapter = _adapter()
+    from plugins.platforms.telegram import adapter as telegram_module
+    class Button:
+        def __init__(self, text, callback_data):
+            self.text, self.callback_data = text, callback_data
+    class Markup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+    monkeypatch.setattr(telegram_module, "InlineKeyboardButton", Button)
+    monkeypatch.setattr(telegram_module, "InlineKeyboardMarkup", Markup)
+    loop = asyncio.new_event_loop()
+    runner = SimpleNamespace(_gateway_loop=loop)
+    import threading
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="lane", profile="default")
+    proposal = "cal_access_health_intro_20260924_1000"
+    try:
+        async def exercise():
+            with patch("tools.send_message_senders._live_adapter", return_value=(runner, adapter)):
+                return await asyncio.to_thread(registry.dispatch, "send_action_buttons", {
+                    "proposal_id": proposal, "message": "Access Health call"})
+        result = json.loads(asyncio.run(exercise()))
+        assert result == {"success": True, "message_id": "42", "proposal_id": proposal}
+        sent = adapter._bot.send_message.call_args.kwargs
+        assert "Calendar proposal" in sent["text"]
+        button_id = sent["reply_markup"].inline_keyboard[0][0].callback_data.split(":")[1]
+        assert buttons.claim(button_id, "123", "", "lane", "42") == proposal
+    finally:
+        clear_session_vars(tokens)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join()
+        loop.close()
+
+def test_storypark_card_requires_pending_and_queues_exact_choice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    discover_builtin_tools()
+    adapter = _adapter()
+    from plugins.platforms.telegram import adapter as telegram_module
+    class Button:
+        def __init__(self, text, callback_data):
+            self.text, self.callback_data = text, callback_data
+    class Markup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+    monkeypatch.setattr(telegram_module, "InlineKeyboardButton", Button)
+    monkeypatch.setattr(telegram_module, "InlineKeyboardMarkup", Markup)
+    loop = asyncio.new_event_loop()
+    runner = SimpleNamespace(_gateway_loop=loop)
+    import threading
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="lane", profile="default")
+    proposal = "storypark_attendance_98315"
+    async def exercise():
+        with patch("tools.send_message_senders._live_adapter", return_value=(runner, adapter)):
+            return await asyncio.to_thread(registry.dispatch, "send_action_buttons", {
+                "proposal_id": proposal, "message": "Seven pre-filled weeks"})
+    try:
+        missing = json.loads(asyncio.run(exercise()))
+        assert "not pending" in missing["error"]
+        assert not adapter._bot.send_message.called
+        pending = tmp_path / "state" / "client-comms-pending" / f"approve_{proposal}.json"
+        pending.parent.mkdir(parents=True)
+        pending.write_text("{}")
+        result = json.loads(asyncio.run(exercise()))
+        assert result == {"success": True, "message_id": "42", "proposal_id": proposal}
+        sent = adapter._bot.send_message.call_args.kwargs
+        assert "Village Green attendance verification" in sent["text"]
+        button_id = sent["reply_markup"].inline_keyboard[0][0].callback_data.split(":")[1]
+        assert buttons.claim(button_id, "123", "", "lane", "42") == proposal
+    finally:
+        clear_session_vars(tokens)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join()
+        loop.close()
+
 
 @pytest.mark.asyncio
 async def test_independent_clicks_queue_without_interrupt_and_failures_retry(tmp_path, monkeypatch):
@@ -120,3 +200,14 @@ async def test_independent_clicks_queue_without_interrupt_and_failures_retry(tmp
     adapter.handle_message = refused
     await adapter._handle_frnd_action_callback(query(44), "ab:three:a", cb)
     assert buttons.claim("three", "123", "", "lane", "44") == "frnd-a3"
+
+    buttons._insert("calendar", "123", "", "lane", "cal_intro_123")
+    buttons._bind("calendar", "45")
+    adapter.handle_message = admit
+    await adapter._handle_frnd_action_callback(query(45), "ab:calendar:a", cb)
+    assert queued[-1].text == "approve cal_intro_123"
+
+    buttons._insert("storypark", "123", "", "lane", "storypark_attendance_98315")
+    buttons._bind("storypark", "46")
+    await adapter._handle_frnd_action_callback(query(46), "ab:storypark:d", cb)
+    assert queued[-1].text == "deny storypark_attendance_98315"
