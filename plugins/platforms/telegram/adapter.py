@@ -4289,9 +4289,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_frnd_action_buttons(self, chat_id: str, thread_id: str, message: str,
                                        button_id: str, proposal_id: str) -> SendResult:
-        """One independent, non-expiring FRND card in the current chat/topic."""
+        """One independent, non-expiring proposal card in the current chat/topic."""
         def build():
-            text = f"<b>FRND proposal {_html.escape(proposal_id)}</b>\n\n{_html.escape(message)}"
+            label = ("Village Green attendance verification" if proposal_id.startswith("storypark_attendance_")
+                     else "Calendar proposal" if proposal_id.startswith("cal_") else "FRND proposal")
+            text = f"<b>{label} {_html.escape(proposal_id)}</b>\n\n{_html.escape(message)}"
             if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
                 return SendResult(success=False, error="Proposal card exceeds Telegram message limit")
             keyboard = InlineKeyboardMarkup([[
@@ -4721,7 +4723,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
     async def _handle_frnd_action_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
-        """Admit an authenticated FRND choice as its own queued chat turn."""
+        """Admit an authenticated proposal choice as its own queued chat turn."""
         parts = data.split(":")
         if len(parts) != 3 or parts[2] not in {"a", "d"}:
             await query.answer(text="Invalid proposal button.")
