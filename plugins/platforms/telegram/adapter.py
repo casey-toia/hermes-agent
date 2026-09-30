@@ -4824,7 +4824,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(parts) != 3 or parts[2] not in {"a", "d"}:
             await query.answer(text="Invalid proposal button.")
             return
-        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+        if not await self._callback_authorized(query, cb, _unauthorized()):
             return
         message = getattr(query, "message", None)
         if message is None or cb["chat_id"] is None or getattr(message, "message_id", None) is None:

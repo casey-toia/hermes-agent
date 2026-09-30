@@ -161,8 +161,10 @@ async def test_independent_clicks_queue_without_interrupt_and_failures_retry(tmp
     adapter = _adapter()
     from gateway.run import GatewayRunner
     runner = GatewayRunner.__new__(GatewayRunner)
-    runner._queued_events = {}
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda source: adapter)
+    monkeypatch.setattr(runner, "_peek_session_state", lambda session_key: state)
+    monkeypatch.setattr(runner, "_session_state", lambda session_key: state)
     queued = []
 
     async def admit(event):
@@ -187,7 +189,7 @@ async def test_independent_clicks_queue_without_interrupt_and_failures_retry(tmp
     await adapter._handle_frnd_action_callback(second, "ab:two:d", cb)
     assert [event.text for event in queued] == ["approve frnd-a1", "deny frnd-a2"]
     assert all(event.internal and not event.allow_gateway_control for event in queued)
-    assert runner._queued_events["lane"][0].text == "deny frnd-a2"
+    assert state.conversation.queued_events[0].text == "deny frnd-a2"
     assert adapter._pending_messages["lane"].text == "approve frnd-a1"
     await adapter._handle_frnd_action_callback(first, "ab:one:d", cb)
     assert len(queued) == 2  # first card consumed, second remains independent
